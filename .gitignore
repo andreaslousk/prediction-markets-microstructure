@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local DuckDB cache (regenerate with: python main.py)
+*.parquet
+
+# macOS
+.DS_Store
