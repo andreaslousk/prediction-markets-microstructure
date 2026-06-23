@@ -222,3 +222,6 @@ __marimo__/
 
 # macOS
 .DS_Store
+
+# Exploratory notebook (kept local)
+sandbox.ipynb
