@@ -228,11 +228,32 @@ def _add_ttest(df, mean='delta', sd='sd_dev', n='n'):
 
 
 def _taker_pnl(a=''):
-    """Per-contract TAKER PnL over ALL trades (maker = -taker). `a` is an optional
-    table alias. taker buys YES at p -> (y - p); taker buys NO at (1-p) -> (p - y)."""
+    """Per-contract TAKER gross PnL (maker = -taker). `a` is an optional table alias.
+    taker buys YES at p -> (y - p); taker buys NO at (1-p) -> (p - y)."""
     p = (a + '.') if a else ''
     return (f"(CASE WHEN {p}taker_side='yes' THEN ({p}result='yes')::INT - {p}yes_price/100.0 "
             f"ELSE {p}yes_price/100.0 - ({p}result='yes')::INT END)")
+
+
+# Kalshi per-contract trading fees = rate * p * (1-p)  (p = yes_price/100; side-symmetric)
+TAKER_FEE_RATE = 0.07
+MAKER_FEE_RATE = 0.0175
+
+
+def _fee(rate, a=''):
+    """Per-contract fee expression: rate * p * (1-p), p = yes_price/100."""
+    p = (a + '.') if a else ''
+    return f"({rate} * ({p}yes_price/100.0) * (1 - {p}yes_price/100.0))"
+
+
+def _taker_pnl_net(a=''):
+    """Taker PnL net of the taker fee."""
+    return f"({_taker_pnl(a)} - {_fee(TAKER_FEE_RATE, a)})"
+
+
+def _maker_pnl_net(a=''):
+    """Maker PnL net of the maker fee (= -taker_gross - maker_fee; NOT -taker_net)."""
+    return f"(-({_taker_pnl(a)}) - {_fee(MAKER_FEE_RATE, a)})"
 
 
 def calibration_table(con, source, side='yes'):
@@ -351,6 +372,29 @@ def aggregate_vwar(con, source):
     r = con.execute(q).df().iloc[0]
     return {'taker_vwar_pp': float(r['taker_pp']), 'maker_vwar_pp': -float(r['taker_pp']),
             'contracts': int(r['contracts'])}
+
+
+def fee_comparison(con, source, categorize_fn=None):
+    """Maker & taker VWAR (pp) GROSS and NET of Kalshi fees, overall ('All') + per
+    category. Per-contract fees: taker 0.07*p*(1-p), maker 0.0175*p*(1-p). Net of fees
+    maker != -taker (both pay the house), so each side is computed directly. Columns
+    *_fee_pp are the volume-weighted average fee drag (gross - net)."""
+    _series_map(con, source, categorize_fn)
+    sel = (f"sum({_taker_pnl('t')}*t.count)/sum(t.count)*100 AS taker_gross, "
+           f"sum({_taker_pnl_net('t')}*t.count)/sum(t.count)*100 AS taker_net, "
+           f"sum(-({_taker_pnl('t')})*t.count)/sum(t.count)*100 AS maker_gross, "
+           f"sum({_maker_pnl_net('t')}*t.count)/sum(t.count)*100 AS maker_net, "
+           f"sum(t.count) AS contracts")
+    by = con.execute(f"SELECT s.category, {sel} FROM {source} t JOIN series_map s USING (series) "
+                     f"GROUP BY 1").df()
+    allrow = con.execute(f"SELECT 'All' AS category, {sel} FROM {source} t "
+                         f"JOIN series_map s USING (series)").df()
+    out = pd.concat([allrow, by.sort_values('contracts', ascending=False)], ignore_index=True)
+    out['taker_fee_pp'] = out['taker_gross'] - out['taker_net']
+    out['maker_fee_pp'] = out['maker_gross'] - out['maker_net']
+    out['vol_share_pct'] = 100 * out['contracts'] / out.loc[out['category'] != 'All', 'contracts'].sum()
+    return out[['category', 'taker_gross', 'taker_net', 'taker_fee_pp',
+                'maker_gross', 'maker_net', 'maker_fee_pp', 'vol_share_pct', 'contracts']]
 
 
 def _series_map(con, source, categorize_fn=None):
@@ -891,6 +935,20 @@ def plot_category(cat, title='Maker VWAR vs. half-spread by category', save=None
     _finish(fig, save)
 
 
+def plot_fee_comparison(fc, title='Maker & Taker VWAR: gross vs. net of fees', save=None):
+    c = fc[fc['category'] != 'All'].sort_values('contracts')
+    y = np.arange(len(c)); h = 0.38
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(15, 0.55 * len(c) + 2), sharey=True)
+    a1.barh(y + h/2, c['maker_gross'], height=h, color='#9ecae1', label='gross')
+    a1.barh(y - h/2, c['maker_net'],   height=h, color='#2ca02c', label='net of fees')
+    a1.axvline(0, color='k', lw=0.8); a1.set_title('Maker VWAR'); a1.set_xlabel('pp'); a1.legend()
+    a1.set_yticks(y); a1.set_yticklabels(c['category'])
+    a2.barh(y + h/2, c['taker_gross'], height=h, color='#fdae6b', label='gross')
+    a2.barh(y - h/2, c['taker_net'],   height=h, color='#d62728', label='net of fees')
+    a2.axvline(0, color='k', lw=0.8); a2.set_title('Taker VWAR'); a2.set_xlabel('pp'); a2.legend()
+    fig.suptitle(title, fontweight='bold'); _finish(fig, save)
+
+
 def plot_data_summary(d, title='Data breakdown by category', save=None):
     c = d[d['category'] != 'All'].sort_values('contracts')
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -1041,6 +1099,14 @@ def run_all(con, source, outdir='results', thresh=1.0):
     print(f"AGGREGATE  maker VWAR = {agg['maker_vwar_pp']:+.3f} pp  "
           f"(taker {agg['taker_vwar_pp']:+.3f} pp)  over {agg['contracts']:,} contracts")
 
+    # Returns gross vs net of Kalshi fees (taker 0.07*p(1-p), maker 0.0175*p(1-p))
+    fee = fee_comparison(con, source)
+    fee.to_csv(p('fee_comparison.csv'), index=False)
+    plot_fee_comparison(fee, save=p('fee_comparison.png'))
+    a = fee[fee['category'] == 'All'].iloc[0]
+    print(f"FEES       maker {a['maker_gross']:+.3f}->{a['maker_net']:+.3f}pp (fee {a['maker_fee_pp']:.3f}) | "
+          f"taker {a['taker_gross']:+.3f}->{a['taker_net']:+.3f}pp (fee {a['taker_fee_pp']:.3f})")
+
     # Spread-compensation test (paper Section V): both equal- and volume-weighted
     sc, _ = spread_compensation(con, source)
     print(f"SPREAD     maker {sc['maker_vwar_pp']:+.3f}pp vs half-spread {sc['half_spread_pp']:.3f}pp "
@@ -1123,7 +1189,8 @@ def run_all(con, source, outdir='results', thresh=1.0):
     print("tables: data_summary.csv, calibration.csv, deltatime_regression.csv, "
           "category_breakdown.csv, yes_no_share.csv, vwar_by_side.csv, vwar_category_ttc.csv, "
           "calibration_by_category.csv, vwar_side_by_category.csv")
-    return {'data_summary': summ, 'aggregate': agg, 'spread_compensation': sc, 'spread_hac': hac,
+    return {'data_summary': summ, 'aggregate': agg, 'fee_comparison': fee,
+            'spread_compensation': sc, 'spread_hac': hac,
             'calibration': cal, 'calibration_by_ttc': d, 'deltatime': reg,
             'vwar_by_price': pb, 'vwar_grid': grid, 'category': cat,
             'yes_no_share': yn, 'vwar_by_side': side,
